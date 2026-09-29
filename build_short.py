@@ -1,135 +1,221 @@
-import os, json, re, html, textwrap, subprocess
+import os
+import re
+import json
+import html
+import textwrap
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
+from xml.etree import ElementTree as ET
 
-import feedparser
+import requests
+from PIL import Image, ImageDraw, ImageFont
 from google import genai
 from google.genai import types
-from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data"
 OUT = ROOT / "output"
-DATA.mkdir(exist_ok=True)
+DATA = ROOT / "data"
 OUT.mkdir(exist_ok=True)
+DATA.mkdir(exist_ok=True)
 
 SEEN_FILE = DATA / "seen.json"
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Free, public Google News RSS searches. These are deliberately broad so the
-# channel covers trailers across all movie genres instead of one niche.
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set.")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Broad Google News searches. These are intentionally broad so a new trailer
+# does not disappear just because a publisher used different wording.
 QUERIES = [
-    '"official trailer" movie when:2d',
-    '"official teaser" movie when:2d',
-    '"trailer" "movie" when:2d',
-    '"teaser trailer" movie when:2d',
+    '"official trailer" movie when:3d',
+    '"official teaser" movie when:3d',
+    '"new trailer" movie when:3d',
+    '"first trailer" movie when:3d',
+    '"movie trailer" "2026" when:3d',
+    '"movie trailer" "2027" when:3d',
 ]
 
-def clean_html(value):
+def clean_text(value):
     value = html.unescape(value or "")
-    return re.sub(r"<[^>]+>", " ", value).replace("\xa0", " ").strip()
+    return re.sub(r"\s+", " ", value).strip()
+
+def google_news_url(query):
+    return (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(query)
+        + "&hl=en-US&gl=US&ceid=US:en"
+    )
+
+def fetch_candidates():
+    headers = {"User-Agent": "Mozilla/5.0 (New-Movies trailer bot)"}
+    candidates = []
+    seen_urls = set()
+
+    for query in QUERIES:
+        url = google_news_url(query)
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+        except Exception as exc:
+            print(f"RSS warning for {query}: {exc}")
+            continue
+
+        for item in root.findall(".//item"):
+            title = clean_text(item.findtext("title"))
+            link = clean_text(item.findtext("link"))
+            pub = clean_text(item.findtext("pubDate"))
+            desc = clean_text(item.findtext("description"))
+
+            if not title or not link or link in seen_urls:
+                continue
+
+            # Ignore obvious TV/episode/news-only stories. Keep broad movie genres.
+            low = title.lower()
+            if any(x in low for x in [
+                "tv series", "tv show", "episode", "season premiere",
+                "series finale", "television"
+            ]):
+                continue
+
+            seen_urls.add(link)
+            candidates.append({
+                "title": title,
+                "link": link,
+                "published": pub,
+                "description": desc,
+            })
+
+    # Newest-looking items first. Google News feeds generally put newest first;
+    # retaining feed order avoids depending on locale-specific date parsing.
+    return candidates
 
 def load_seen():
     if not SEEN_FILE.exists():
-        return []
+        return set()
     try:
-        return json.loads(SEEN_FILE.read_text())
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        return set(data if isinstance(data, list) else [])
     except Exception:
-        return []
+        return set()
 
-def save_seen(items):
-    SEEN_FILE.write_text(json.dumps(items[-500:], indent=2))
+def save_seen(seen):
+    SEEN_FILE.write_text(
+        json.dumps(sorted(seen), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
-def fetch_candidates():
-    found = {}
-    for q in QUERIES:
-        url = (
-            "https://news.google.com/rss/search?q="
-            + quote_plus(q)
-            + "&hl=en-US&gl=US&ceid=US:en"
-        )
-        feed = feedparser.parse(url)
-        for e in feed.entries:
-            title = clean_html(getattr(e, "title", ""))
-            link = getattr(e, "link", "")
-            if not title or not link:
-                continue
-
-            # Keep items that look like actual movie-trailer announcements.
-            low = title.lower()
-            if not any(k in low for k in ("trailer", "teaser", "first look")):
-                continue
-
-            published = getattr(e, "published", "") or getattr(e, "updated", "")
-            summary = clean_html(getattr(e, "summary", ""))
-            key = getattr(e, "id", "") or link
-            found[key] = {
-                "id": key,
-                "title": title,
-                "link": link,
-                "summary": summary[:2500],
-                "published": published,
-                "source": clean_html(getattr(getattr(e, "source", None), "title", "")),
-            }
-
-    # Newest first.
-    return sorted(found.values(), key=lambda x: x.get("published", ""), reverse=True)
-
-def choose_unseen(candidates, seen):
-    seen_set = set(seen)
-    for item in candidates:
-        if item["id"] not in seen_set:
-            return item
+def pick_unseen(candidates, seen):
+    for c in candidates:
+        key = c["link"]
+        if key not in seen:
+            return c
     return None
 
-def make_package(item):
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
+def research_movie(candidate):
     prompt = f"""
-You are producing a 30-60 second faceless YouTube Short about a newly reported movie trailer.
+You are researching a newly reported movie trailer for a faceless YouTube Shorts channel.
 
-SOURCE HEADLINE: {item['title']}
-SOURCE: {item['source']}
-SOURCE SUMMARY: {item['summary']}
-SOURCE LINK: {item['link']}
+Candidate news item:
+TITLE: {candidate['title']}
+URL: {candidate['link']}
+PUBLISHED: {candidate['published']}
+DESCRIPTION: {candidate['description'][:2500]}
 
-Use Google Search to verify the movie title, genre, release timing, studio/distributor,
-main cast, and what is actually known about this trailer. Do not invent details.
-Write punchy but factual commentary for a general movie audience.
-
+Use current web information to verify this is about a MOVIE trailer or teaser.
 Return ONLY valid JSON with these keys:
-movie_title, genre, release_info, hook, narration, youtube_title, description, hashtags
+movie_title, genre, release_info, studio_or_distributor, cast,
+trailer_status, hook, narration, youtube_title, description, hashtags
 
 Requirements:
-- narration: about 80-110 words, natural spoken English, no stage directions.
-- hook: one short sentence.
-- youtube_title: compelling but not misleading.
-- description: 2-4 sentences and include the source link.
-- hashtags: 5-8 hashtags.
+- If it is not a movie trailer/teaser, set trailer_status to "REJECT".
+- Do not invent facts.
+- narration should be about 75-110 words, original commentary, not a transcript.
+- hook should be 1 punchy sentence.
+- youtube_title should be under 90 characters.
+- description should briefly explain what the movie is and what the trailer reveals.
+- hashtags should be an array of 4-8 strings.
 """
-
+    # Current Google documentation lists Gemini 3.5 Flash-Lite among the current
+    # low-cost/high-throughput models. Google Search grounding is used for fresh
+    # verification when available.
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.7,
+            temperature=0.4,
         ),
     )
     text = response.text.strip()
-    text = re.sub(r"^```json\s*|\s*```$", "", text, flags=re.I)
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
     return json.loads(text)
 
-def tts(text, out_wav):
-    client = genai.Client(api_key=GEMINI_API_KEY)
+def get_font(size, bold=False):
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for p in paths:
+        if Path(p).exists():
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+def make_cards(info):
+    W, H = 1080, 1920
+    font_big = get_font(78, True)
+    font_mid = get_font(48, True)
+    font_small = get_font(34, False)
+
+    cards = [
+        ("NEW MOVIE TRAILER", info["movie_title"], info["genre"]),
+        (info["hook"], info["movie_title"], info["release_info"]),
+        ("WHAT TO KNOW", info["narration"], info["studio_or_distributor"]),
+    ]
+
+    paths = []
+    for i, (top, main, bottom) in enumerate(cards, 1):
+        im = Image.new("RGB", (W, H), (18, 18, 22))
+        d = ImageDraw.Draw(im)
+
+        d.text((70, 120), "WIDELY AWAKEN", font=font_small, fill=(235, 235, 235))
+
+        y = 330
+        for block, font in [(top, font_mid), (main, font_big)]:
+            wrapped = textwrap.wrap(str(block), width=22 if font == font_big else 32)
+            for line in wrapped:
+                d.text((70, y), line, font=font, fill=(255, 255, 255))
+                y += font.size + 18
+            y += 30
+
+        wrapped = textwrap.wrap(str(bottom), width=34)
+        y = 1450
+        for line in wrapped[:5]:
+            d.text((70, y), line, font=font_small, fill=(210, 210, 210))
+            y += 48
+
+        path = OUT / f"card_{i}.png"
+        im.save(path)
+        paths.append(path)
+    return paths
+
+def make_tts(text):
     response = client.models.generate_content(
         model="gemini-3.8-flash-lite-tts",
         contents=[{
             "role": "user",
             "parts": [{
                 "text": text,
-                "speech_metadata": {"style": "energetic, clear movie-news narrator"},
+                "speech_metadata": {
+                    "style": "confident, energetic movie-news narrator; natural pace"
+                },
             }],
         }],
         config={
@@ -138,98 +224,78 @@ def tts(text, out_wav):
         },
     )
     data = response.candidates[0].content.parts[0].inline_data.data
-    out_wav.write_bytes(data)
+    wav = OUT / "voice.wav"
+    wav.write_bytes(data)
+    return wav
 
-def get_font(size):
-    for path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    ]:
-        if Path(path).exists():
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+def render_video(cards, wav):
+    # Each card is shown for an equal slice of the narration length.
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(wav)],
+        capture_output=True, text=True, check=True
+    )
+    duration = max(float(probe.stdout.strip()), 8.0)
+    per = duration / len(cards)
 
-def make_cards(pkg, card_dir):
-    card_dir.mkdir(parents=True, exist_ok=True)
-    title_font = get_font(92)
-    body_font = get_font(54)
-    small_font = get_font(36)
+    inputs = []
+    filters = []
+    for idx, card in enumerate(cards):
+        inputs += ["-loop", "1", "-t", str(per), "-i", str(card)]
+        filters.append(f"[{idx}:v]scale=1080:1920,format=yuv420p[v{idx}]")
+    filters.append("".join(f"[v{i}]" for i in range(len(cards))) +
+                   f"concat=n={len(cards)}:v=1:a=0[outv]")
 
-    cards = [
-        ("NEW TRAILER", pkg["movie_title"], 4.0),
-        (pkg["genre"].upper(), pkg["release_info"], 4.0),
-        ("WHAT TO KNOW", pkg["hook"], 5.0),
-        ("MORE MOVIE NEWS", "Follow for the next trailer drop.", 4.0),
-    ]
-
-    paths = []
-    for i, (top, main, duration) in enumerate(cards):
-        img = Image.new("RGB", (1080, 1920), (10, 12, 18))
-        draw = ImageDraw.Draw(img)
-        draw.text((70, 130), top, font=small_font, fill=(220, 220, 220))
-        y = 600
-        for line in textwrap.wrap(main, width=20):
-            draw.text((70, y), line, font=title_font if i == 0 else body_font, fill=(255,255,255))
-            y += 120 if i == 0 else 82
-        path = card_dir / f"card_{i}.png"
-        img.save(path)
-        paths.append((path, duration))
-    return paths
-
-def render_video(pkg, narration, out_mp4):
-    work = OUT / "work"
-    cards = make_cards(pkg, work / "cards")
-    wav = work / "voice.wav"
-    wav.parent.mkdir(parents=True, exist_ok=True)
-    tts(narration, wav)
-
-    concat = work / "concat.txt"
-    with concat.open("w", encoding="utf-8") as f:
-        for path, duration in cards:
-            f.write(f"file '{path.as_posix()}'\n")
-            f.write(f"duration {duration}\n")
-        # ffmpeg concat demuxer requires the last file to be repeated.
-        f.write(f"file '{cards[-1][0].as_posix()}'\n")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0", "-i", str(concat),
-        "-i", str(wav),
-        "-vf", "scale=1080:1920,format=yuv420p",
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest", str(out_mp4),
-    ]
+    cmd = ["ffmpeg", "-y", *inputs, "-i", str(wav),
+           "-filter_complex", ";".join(filters),
+           "-map", "[outv]", "-map", f"{len(cards)}:a",
+           "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-shortest", str(OUT / "movie_trailer_short.mp4")]
     subprocess.run(cmd, check=True)
 
 def main():
-    seen = load_seen()
     candidates = fetch_candidates()
-    item = choose_unseen(candidates, seen)
+    print(f"Found {len(candidates)} recent trailer-news candidates.")
 
-    if not item:
-        print(f"No unseen trailer found. Checked {len(candidates)} recent candidates.")
+    seen = load_seen()
+    candidate = pick_unseen(candidates, seen)
+
+    if not candidate:
+        print("No unseen trailer found.")
+        print("Candidate titles checked:")
+        for c in candidates[:10]:
+            print(" -", c["title"])
         return
 
-    print(f"Selected trailer candidate: {item['title']}")
-    pkg = make_package(item)
+    print("Candidate:", candidate["title"])
+    info = research_movie(candidate)
 
-    narration = pkg["narration"]
-    video = OUT / "movie_trailer_short.mp4"
-    render_video(pkg, narration, video)
+    if str(info.get("trailer_status", "")).upper() == "REJECT":
+        seen.add(candidate["link"])
+        save_seen(seen)
+        print("Candidate rejected as not a movie trailer.")
+        return
+
+    wav = make_tts(info["narration"])
+    cards = make_cards(info)
+    render_video(cards, wav)
 
     metadata = {
-        **item,
-        **pkg,
+        **info,
+        "source_news_url": candidate["link"],
+        "source_news_title": candidate["title"],
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "video_file": video.name,
     }
-    (OUT / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (OUT / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
-    seen.append(item["id"])
+    seen.add(candidate["link"])
     save_seen(seen)
-    print(f"Created: {video}")
-    print(f"Movie: {pkg['movie_title']}")
+
+    print("Created Short for:", info["movie_title"])
+    print("Output:", OUT / "movie_trailer_short.mp4")
 
 if __name__ == "__main__":
     main()
