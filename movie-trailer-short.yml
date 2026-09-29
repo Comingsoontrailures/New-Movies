@@ -1,0 +1,44 @@
+name: New Movie Trailer Shorts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build-short:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install requests feedparser google-genai
+
+      - name: Build the latest Short
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scripts/build_short.py
+
+      - name: Save trailer tracking
+        run: |
+          git config user.name "movie-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "Update trailer tracking"
+          git push || true
+
+      - name: Upload finished Short for approval
+        uses: actions/upload-artifact@v4
+        with:
+          name: movie-short
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 7
